@@ -1,0 +1,13 @@
+/data/
+/results/
+*.h5ad
+*.rds
+*.parquet
+*.log
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.Rhistory
+.RData
+.Rproj.user/
