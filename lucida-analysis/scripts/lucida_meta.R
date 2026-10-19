@@ -2,8 +2,11 @@
 
 # lucida_meta.R
 #
-# Run disease-level fixed-effect inverse-variance meta-analysis across DEG tables
-# that were already produced by lucida_contrast.R for individual cohorts.
+# Run disease-level fixed-effect meta-analysis across DEG tables that were
+# already produced by lucida_contrast.R for individual cohorts, following
+# https://gist.github.com/GabrielHoffman/d01e1b778fc0ca9f41a8232fab14478f :
+# metafor::rma(yi = logFC, sei = se, method = 'FE') for each gene x cell type,
+# then one FDR correction across all gene x cell-type rows.
 #
 # This script covers only cross-cohort aggregation. It does NOT run lucida itself.
 #
@@ -21,11 +24,17 @@
 #   available. Otherwise it falls back to compressed CSV (`.csv.gz`).
 # - Standard errors are taken from `se` / `std.error` when present, or derived as
 #   abs(logFC / t) if only the Lucida t-statistic is available.
-# - P-values are BH-adjusted within assay / cell type.
+# - adj.P.Val is BH (`p.adjust(..., 'fdr')`) across all gene x cell-type rows,
+#   as in the gist. adj.P.Val.assay keeps the previous within-cell-type BH for
+#   comparison.
+# - A gene x cell type observed in only one cohort is still fitted (rma with
+#   k = 1 returns that cohort's estimate with a Wald z-test); n.studies and
+#   datasets record this so single-cohort rows can be filtered downstream.
 
 suppressPackageStartupMessages({
   library(dplyr)
   library(ggplot2)
+  library(metafor)
 })
 
 options(stringsAsFactors = FALSE)
@@ -40,7 +49,7 @@ usage <- function() {
     'Usage:\n',
     '  Rscript lucida_meta.R --out_dir <dir> --disease <disease> [--control CTRL] [--method FE]\n',
     '    --input <cohort1_deg.{csv.gz|parquet}> --input <cohort2_deg.{csv.gz|parquet}> [--input ...]\n',
-    '    [--plot_ncol 6] [--plot_dpi 300] [--plot_width 16] [--plot_height 16]\n',
+    '    [--nthreads 8] [--plot_ncol 6] [--plot_dpi 300] [--plot_width 16] [--plot_height 16]\n',
     sep = ''
   )
 }
@@ -48,6 +57,7 @@ usage <- function() {
 default_options <- list(
   control = 'CTRL',
   method = 'FE',
+  nthreads = '8',
   plot_ncol = '6',
   plot_dpi = '300',
   plot_width = '16',
@@ -231,32 +241,49 @@ derive_standard_error <- function(tab) {
   se
 }
 
-fixed_effect_meta <- function(tab) {
+# Fit metafor::rma(method = 'FE') to one gene x cell type. Q / I2 are the
+# heterogeneity test and statistic across cohorts (Q = 0, I2 = 0 when k = 1).
+rma_fe_one <- function(logFC, se) {
+  fit <- metafor::rma(yi = logFC, sei = se, method = 'FE')
+  c(
+    estimate = as.numeric(fit$beta),
+    std.error = fit$se,
+    statistic = fit$zval,
+    p.value = fit$pval,
+    Q = fit$QE,
+    Q.p.value = fit$QEp,
+    I2 = fit$I2,
+    n.studies = fit$k
+  )
+}
+
+fixed_effect_meta <- function(tab, nthreads = 1L) {
   tab$std.error.meta <- derive_standard_error(tab)
   work <- tab %>%
     dplyr::filter(is.finite(logFC), is.finite(std.error.meta), std.error.meta > 0) %>%
-    dplyr::mutate(w = 1 / (std.error.meta^2), wb = w * logFC)
+    dplyr::arrange(assay, ID)
 
-  work %>%
-    dplyr::group_by(ID, assay) %>%
-    dplyr::summarise(
-      sum_w = sum(w),
-      sum_wb = sum(wb),
-      n.studies = dplyr::n(),
-      datasets = paste(sort(unique(Dataset)), collapse = ','),
-      .groups = 'drop'
-    ) %>%
-    dplyr::mutate(
-      estimate = sum_wb / sum_w,
-      std.error = sqrt(1 / sum_w),
-      statistic = estimate / std.error,
-      p.value = 2 * pnorm(abs(statistic), lower.tail = FALSE),
-      method = 'FE'
-    ) %>%
-    dplyr::select(ID, assay, estimate, std.error, statistic, p.value, n.studies, method, datasets) %>%
+  # One rma() per gene x cell type, chunked across forked workers.
+  key <- paste(work$assay, work$ID, sep = '\r')
+  rows_by_group <- split(seq_len(nrow(work)), factor(key, levels = unique(key)))
+  chunks <- split(seq_along(rows_by_group), cut(seq_along(rows_by_group), max(1L, nthreads), labels = FALSE))
+  fits <- parallel::mclapply(chunks, function(idx) {
+    t(vapply(rows_by_group[idx], function(r) rma_fe_one(work$logFC[r], work$std.error.meta[r]), numeric(8)))
+  }, mc.cores = nthreads)
+  stats <- as.data.frame(do.call(rbind, unname(fits)))
+
+  first <- vapply(rows_by_group, `[`, integer(1), 1L)
+  meta <- data.frame(ID = work$ID[first], assay = work$assay[first], stats, row.names = NULL)
+  meta$n.studies <- as.integer(meta$n.studies)
+  meta$method <- 'FE'
+  meta$datasets <- vapply(rows_by_group, function(r) paste(sort(unique(work$Dataset[r])), collapse = ','), character(1))
+
+  meta %>%
+    dplyr::mutate(adj.P.Val = p.adjust(p.value, method = 'fdr')) %>%
     dplyr::group_by(assay) %>%
-    dplyr::mutate(adj.P.Val = p.adjust(p.value, method = 'BH')) %>%
+    dplyr::mutate(adj.P.Val.assay = p.adjust(p.value, method = 'BH')) %>%
     dplyr::ungroup() %>%
+    dplyr::select(ID, assay, estimate, std.error, statistic, p.value, Q, Q.p.value, I2, n.studies, method, datasets, adj.P.Val, adj.P.Val.assay) %>%
     dplyr::arrange(assay, p.value, ID) %>%
     as.data.frame()
 }
@@ -275,9 +302,12 @@ write_summary <- function(meta, out_file, disease, control, method, input_files)
   lines <- c(
     sprintf('# %s vs %s meta-analysis summary', disease, control),
     '',
-    sprintf('Method: %s fixed-effect inverse-variance meta-analysis by gene x cell type', method),
+    sprintf('Method: metafor::rma(method = "%s") by gene x cell type; FDR (BH) across all gene x cell-type rows', method),
     sprintf('Input DEG files (%d):', length(input_files)),
     paste0('- ', input_files),
+    '',
+    sprintf('Single-cohort rows (n.studies = 1): %d of %d, %d with FDR < 0.05',
+      sum(meta$n.studies == 1), nrow(meta), sum(meta$n.studies == 1 & meta$adj.P.Val < 0.05, na.rm = TRUE)),
     '',
     '## Significant meta-analysis rows (FDR < 0.05) by cell type',
     ''
@@ -307,6 +337,7 @@ disease <- require_arg(args, 'disease')
 input_files <- require_arg(args, 'input')
 control <- args[['control']]
 method <- args[['method']]
+nthreads <- as.integer(args[['nthreads']])
 plot_cfg <- list(
   ncol = as.integer(args[['plot_ncol']]),
   dpi = as.integer(args[['plot_dpi']]),
@@ -315,7 +346,7 @@ plot_cfg <- list(
 )
 
 if (!identical(method, 'FE')) {
-  stop('This script currently implements fixed-effect inverse-variance meta-analysis only (method FE)')
+  stop('This script currently implements metafor fixed-effect meta-analysis only (method FE)')
 }
 if (length(input_files) < 2) {
   stop('Meta-analysis requires at least two --input DEG files')
@@ -332,6 +363,10 @@ write_parameter_tsv(param_path, c(
   disease = disease,
   control = control,
   method = method,
+  meta_engine = 'metafor_rma',
+  metafor_version = as.character(utils::packageVersion('metafor')),
+  fdr_scope = 'all_rows',
+  nthreads = nthreads,
   n_inputs = length(input_files),
   input_files = paste(input_files, collapse = ';'),
   plot_ncol = plot_cfg$ncol,
@@ -356,7 +391,7 @@ combined <- dplyr::bind_rows(tabs)
 combined_path <- write_table_auto(combined, file.path(out_dir, paste0(disease, '_combined_deg')))
 log_msg('Saved combined DEG table: %s (%s rows)', combined_path, format(nrow(combined), big.mark = ','))
 
-meta <- fixed_effect_meta(combined)
+meta <- fixed_effect_meta(combined, nthreads = nthreads)
 meta_path <- write_table_auto(meta, file.path(out_dir, paste0(disease, '_meta')))
 log_msg('Saved meta-analysis table: %s (%s rows)', meta_path, format(nrow(meta), big.mark = ','))
 if (!requireNamespace('arrow', quietly = TRUE)) {

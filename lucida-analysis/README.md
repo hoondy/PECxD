@@ -18,7 +18,7 @@ Python dependencies are listed in `requirements.txt`. SCTools is installed from 
 R setup (in R; system build dependencies may also be required):
 
 ```r
-install.packages(c("BiocManager", "remotes", "dplyr", "ggplot2", "ggrepel", "arrow"))
+install.packages(c("BiocManager", "remotes", "dplyr", "ggplot2", "ggrepel", "arrow", "metafor"))
 BiocManager::install(c("SingleCellExperiment", "S4Vectors", "DelayedArray", "rhdf5"))
 remotes::install_github("GabrielHoffman/GenomicDataStream@896288b2a83b5e49047b53d76a2c5b5fc38cda69")
 remotes::install_github("GabrielHoffman/lucida@19909ed9cd38baeea810c7375575025460dabb7d")
@@ -113,7 +113,7 @@ No residualized H5AD is written for these manifest settings. Retain the CSC inpu
 
 ## Optional step 4: cross-cohort meta-analysis
 
-After completing all relevant contrasts, run fixed-effect inverse-variance meta-analysis. For SCZ:
+After completing all relevant contrasts, run a fixed-effect meta-analysis with `metafor::rma(method = "FE")`. For SCZ:
 
 ```bash
 Rscript scripts/lucida_meta.R \
@@ -121,7 +121,7 @@ Rscript scripts/lucida_meta.R \
   --input results/CMC_SCZ_deg.parquet \
   --input results/SZBD_SCZ_deg.parquet \
   --input results/MultiomeBrain_SCZ_deg.parquet \
-  --plot_ncol 6 --plot_dpi 300 --plot_width 20 --plot_height 16
+  --nthreads 8 --plot_ncol 6 --plot_dpi 300 --plot_width 20 --plot_height 16
 ```
 
 Use `.csv.gz` input paths instead when Arrow was unavailable. Repeat with `--disease` and `--input` arguments for these groups:
@@ -131,7 +131,7 @@ Use `.csv.gz` input paths instead when Arrow was unavailable. Repeat with `--dis
 - MDD: `PTSDBrainomics_MDD`, `Turecki_MDD`.
 - PTSD has one cohort and is not meta-analyzed.
 
-The script combines effects by gene and cell type, uses reported standard errors (or derives them from `abs(logFC / t)`), and applies BH correction within cell type. Check `n.studies`: genes need not be available in every cohort. Outputs include combined DEG and meta-analysis tables, a volcano plot, parameter TSV, and summary markdown under `results/meta/`.
+The script follows [this example](https://gist.github.com/GabrielHoffman/d01e1b778fc0ca9f41a8232fab14478f): for each gene and cell type it fits `rma(yi = logFC, sei = se, method = "FE")` using reported standard errors (or `abs(logFC / t)`), then applies one BH correction across all gene × cell-type rows (`adj.P.Val`). The within-cell-type BH is kept as `adj.P.Val.assay`, and `Q`, `Q.p.value`, and `I2` report heterogeneity between cohorts. Check `n.studies`: genes need not pass the expression filter in every cohort, and a row with `n.studies = 1` is that cohort's own estimate re-tested with a z-test, not a combined result. Outputs include combined DEG and meta-analysis tables, a volcano plot, parameter TSV, and summary markdown under `results/meta/`.
 
 ## Scope
 
