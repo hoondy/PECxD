@@ -28,7 +28,7 @@ usage <- function() {
     'Usage:\n',
     '  Rscript lucida_contrast.R --file <cohort_preproc.h5ad> --cohort <name> --out_dir <dir>\n',
     '    --disease <disease> [--control CTRL] [--formula "~ dx + (1|Donor) + Age + Sex + PMI"]\n',
-    '    [--null_formula "~ (1|Donor)"] [--coef dx] [--cell_type_col subclass]\n',
+    '    [--coef dx] [--cell_type_col subclass]\n',
     '    [--random_dx false] [--random_seed auto|integer]\n',
     '    [--nthreads 4] [--chunk_size 1000] [--write_varpart true]\n',
     '    [--write_residualized false] [--plot_ncol 6] [--plot_dpi 220]\n',
@@ -41,7 +41,6 @@ default_options <- list(
   control = 'CTRL',
   coef = 'dx',
   formula = '~ dx + (1|Donor) + Age + Sex + PMI + Chemistry + counts_per_gene + pct_counts_ribo',
-  null_formula = '~ (1|Donor)',
   random_dx = 'false',
   random_seed = 'auto',
   nthreads = '8',
@@ -245,7 +244,7 @@ apply_random_dx <- function(sce, cohort, disease, control, random_seed) {
   sce
 }
 
-prepare_sce <- function(file, disease, control, formula, null_formula = NULL, cell_type_col = 'subclass',
+prepare_sce <- function(file, disease, control, formula, cell_type_col = 'subclass',
                         random_dx = FALSE, random_seed = 104729, cohort = '') {
   log_msg('Loading preprocessed h5ad %s', file)
   rhdf5::h5closeAll()
@@ -255,7 +254,7 @@ prepare_sce <- function(file, disease, control, formula, null_formula = NULL, ce
   if (!cell_type_col %in% colnames(cd)) {
     stop(sprintf('Preprocessed h5ad is missing required cell-type column: %s', cell_type_col))
   }
-  formula_vars <- unique(c(all.vars(formula), if (!is.null(null_formula)) all.vars(null_formula) else character()))
+  formula_vars <- unique(all.vars(formula))
   missing_formula_vars <- setdiff(formula_vars, colnames(cd))
   if (length(missing_formula_vars)) {
     stop(sprintf('Preprocessed h5ad is missing formula covariates: %s', paste(missing_formula_vars, collapse = ', ')))
@@ -314,15 +313,9 @@ render_diag_plots <- function(fit, out_dir, cohort, coef, plot_cfg) {
   ggsave(file.path(out_dir, paste0(cohort, '_volcano.png')), plotVolcano(fit, coef = coef, ncol = plot_cfg$ncol), width = plot_cfg$width, height = plot_cfg$height, dpi = plot_cfg$dpi)
 }
 
-render_varpart_outputs <- function(sce, fit, out_dir, cohort, null_formula, nthreads, chunk_size, plot_cfg, varpart_genes) {
-  cell_type_col <- attr(sce, 'cell_type_col')
-  log_msg('Running null lucida fit for variance partition: %s', deparse(null_formula))
-  fit_null <- lucida(sce, formula = null_formula, cluster_id = cell_type_col, verbose = TRUE, nthreads = nthreads, nReaders = 1, chunkSize = chunk_size)
-  fit_null_path <- file.path(out_dir, paste0(cohort, '_lucida_fit_null.rds'))
-  saveRDS(fit_null, fit_null_path)
-  log_msg('Saved null fit for variance partition: %s', fit_null_path)
-
-  vp <- fitVarPart(fit, fit_null)
+render_varpart_outputs <- function(fit, out_dir, cohort, plot_cfg, varpart_genes) {
+  log_msg('Computing variance partition directly from fitted model')
+  vp <- varpart(fit)
   vp_path <- file.path(out_dir, paste0(cohort, '_varpart.rds'))
   saveRDS(vp, vp_path)
   log_msg('Saved variance-partition results: %s', vp_path)
@@ -400,7 +393,6 @@ if (is.null(cohort) || identical(cohort, '')) cohort <- sub('\\.h5ad$', '', base
 control <- args[['control']]
 coef <- args[['coef']]
 formula <- normalize_formula(args[['formula']])
-null_formula <- normalize_formula(args[['null_formula']])
 nthreads <- as.integer(args[['nthreads']])
 chunk_size <- as.integer(args[['chunk_size']])
 write_varpart <- parse_bool(args[['write_varpart']])
@@ -423,14 +415,12 @@ plot_cfg <- list(
 )
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-if (write_varpart && is.null(null_formula)) stop('Missing required --null_formula when --write_varpart true')
 
 sce <- prepare_sce(
   file = file,
   disease = disease,
   control = control,
   formula = formula,
-  null_formula = null_formula,
   cell_type_col = args[['cell_type_col']],
   random_dx = random_dx,
   random_seed = random_seed,
@@ -446,7 +436,6 @@ write_parameter_tsv(param_path, c(
   disease = disease,
   control = control,
   formula = deparse(formula),
-  null_formula = deparse(null_formula),
   coef = coef,
   random_dx = random_dx,
   randomization_unit = audit$randomization_unit,
@@ -498,7 +487,7 @@ render_diag_plots(fit, out_dir, cohort, coef, plot_cfg)
 log_msg('Saved diagnostic PNGs for %s', cohort)
 
 if (write_varpart) {
-  render_varpart_outputs(sce, fit, out_dir, cohort, null_formula, nthreads, chunk_size, plot_cfg, varpart_genes)
+  render_varpart_outputs(fit, out_dir, cohort, plot_cfg, varpart_genes)
 } else {
   log_msg('Skipping variance-partition outputs (enable with --write_varpart true)')
 }
